@@ -1,7 +1,7 @@
 .env
-chroma_data/
-*.db
 __pycache__/
 *.pyc
+documents.db
+chroma_db/
 venv/
 .venv/
