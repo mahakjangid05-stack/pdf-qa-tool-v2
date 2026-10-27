@@ -1,168 +1,226 @@
-"""
-PDF Q&A Tool v2 - main.py
-
-Flow:
-  /upload-pdf/  -> PDF se text nikalo -> chunks -> ChromaDB me store -> metadata SQLite me
-  /ask/         -> doc_id ke andar relevant chunks dhundo -> Claude se answer lo -> history save
-
-Run:  uvicorn main:app --reload
-Docs: http://127.0.0.1:8000/docs
-"""
-
+import hashlib
 import io
-import logging
+import json
 import os
+import re
+import secrets
 import uuid
-from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Dict, List
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from pydantic import BaseModel
+from PyPDF2 import PdfReader
 
-# .env backend imports se PEHLE load hona zaroori hai
 load_dotenv()
 
-from backend.database import (  # noqa: E402
-    get_chat_history,
-    get_document,
-    init_db,
-    list_documents,
-    save_chat,
-    save_document,
-)
-from backend.llm_handler import generate_answer  # noqa: E402
-from backend.pdf_processor import extract_text  # noqa: E402
-from backend.rag_engine import add_document, delete_document, search  # noqa: E402
+try:
+    import anthropic
+except ImportError:  # anthropic not installed -> mock mode
+    anthropic = None
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("pdf-qa")
-
-MAX_FILE_SIZE_MB = 10
-TOP_K = 4
-USE_MOCK = os.getenv("USE_MOCK", "false").lower() == "true"
-NOT_FOUND_MSG = "Is document me is sawaal ka jawab nahi mila."
+app = FastAPI(title="PDF Q&A Tool v2")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    logger.info("Startup complete | mock_mode=%s", USE_MOCK)
-    yield
+def verify_key(x_api_key: str = Header(None)):
+    expected = os.getenv("APP_API_KEY")
+    if not expected or not x_api_key or not secrets.compare_digest(x_api_key, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-app = FastAPI(title="PDF Q&A Tool", version="2.0.0", lifespan=lifespan)
+# ---------- Config ----------
+API_KEY = os.getenv("ANTHROPIC_API_KEY")
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+client = anthropic.Anthropic(api_key=API_KEY) if (anthropic and API_KEY) else None
+MOCK_MODE = client is None
+
+DATA_FILE = Path("data.json")
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
+TOP_K = 3
+
+STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "of", "in", "on", "to", "and",
+    "or", "for", "with", "what", "who", "how", "why", "when", "where", "this",
+    "that", "it", "about", "me", "tell", "please", "does", "do", "document",
+}
+
+# ---------- Storage ----------
+documents: Dict[str, dict] = {}
+history: Dict[str, List[dict]] = {}
 
 
-# ---------- Schemas ----------
-class AskRequest(BaseModel):
-    doc_id: str = Field(..., min_length=1)
-    question: str = Field(..., min_length=3, max_length=1000)
+def save_data() -> None:
+    DATA_FILE.write_text(
+        json.dumps({"documents": documents, "history": history}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
-class AskResponse(BaseModel):
+def load_data() -> None:
+    if DATA_FILE.exists():
+        try:
+            data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            documents.update(data.get("documents", {}))
+            history.update(data.get("history", {}))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+
+load_data()
+
+
+# ---------- Helpers ----------
+def chunk_pages(pages: List[str]) -> List[dict]:
+    chunks = []
+    step = CHUNK_SIZE - CHUNK_OVERLAP
+    for page_no, text in enumerate(pages, start=1):
+        text = re.sub(r"\s+", " ", text).strip()
+        for start in range(0, len(text), step):
+            piece = text[start:start + CHUNK_SIZE]
+            if piece.strip():
+                chunks.append({"page": page_no, "text": piece})
+    return chunks
+
+
+def keyword_search(question: str, chunks: List[dict]) -> List[dict]:
+    words = [w for w in re.findall(r"\w+", question.lower()) if w not in STOPWORDS]
+    scored = []
+    for chunk in chunks:
+        text = chunk["text"].lower()
+        score = sum(text.count(w) for w in words)
+        if score > 0:
+            scored.append((score, chunk))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [c for _, c in scored[:TOP_K]]
+    if top:
+        return top
+    return chunks[:TOP_K]
+
+
+def ask_llm(question: str, context: str) -> str:
+    if MOCK_MODE:
+        return "[MOCK MODE - no API key set] Most relevant text found:\n\n" + context[:500]
+    msg = client.messages.create(
+        model=MODEL,
+        max_tokens=1000,
+        system=(
+            "You answer questions using ONLY the provided document context. "
+            "If the answer is not in the context, say so clearly. "
+            "Reply in the same language as the question."
+        ),
+        messages=[
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}
+        ],
+    )
+    return msg.content[0].text
+
+
+# ---------- Models ----------
+class QuestionRequest(BaseModel):
     doc_id: str
     question: str
-    answer: str
-    sources: list[dict]
 
 
-# ---------- Routes ----------
+# ---------- Endpoints ----------
 @app.get("/")
 def root():
-    return {"message": "PDF Q&A Tool v2 running", "docs": "/docs"}
+    return {"message": "pdf q&A tool v2 running", "docs": "/docs"}
 
 
 @app.get("/status/")
 def status():
-    return {"status": "ok", "mock_mode": USE_MOCK, "documents": len(list_documents())}
+    return {"status": "ok", "mock_mode": MOCK_MODE, "documents": len(documents)}
 
 
-@app.get("/documents/")
-def documents():
-    return list_documents()
+@app.get("/documents/", dependencies=[Depends(verify_key)])
+def list_documents():
+    return [
+        {
+            "doc_id": doc_id,
+            "filename": d["filename"],
+            "pages": d["pages"],
+            "chunks": len(d["chunks"]),
+        }
+        for doc_id, d in documents.items()
+    ]
 
 
-@app.get("/history/{doc_id}")
-def history(doc_id: str):
-    if get_document(doc_id) is None:
-        raise HTTPException(status_code=404, detail="doc_id nahi mila.")
-    return get_chat_history(doc_id)
+@app.get("/history/{doc_id}", dependencies=[Depends(verify_key)])
+def get_history(doc_id: str):
+    if doc_id not in documents:
+        raise HTTPException(status_code=404, detail="doc_id not found")
+    return history.get(doc_id, [])
 
 
-@app.post("/upload-pdf/")
-def upload_pdf(file: UploadFile = File(...)):
+@app.post("/upload-pdf/", dependencies=[Depends(verify_key)])
+async def upload_pdf(file: UploadFile = File(...)):
     if not (file.filename or "").lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Sirf .pdf file allowed hai.")
-
-    data = file.file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="File empty hai.")
-    if len(data) > MAX_FILE_SIZE_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"File {MAX_FILE_SIZE_MB}MB se badi hai.")
+        raise HTTPException(status_code=400, detail="Only .pdf files are allowed")
+    raw = await file.read()
+    file_hash = hashlib.sha256(raw).hexdigest()
+    for existing_id, existing in documents.items():
+        if existing.get("file_hash") == file_hash:
+            return {
+                "doc_id": existing_id,
+                "filename": existing["filename"],
+                "pages": existing["pages"],
+                "chunks": len(existing["chunks"]),
+                "duplicate": True,
+            }
 
     try:
-        pages = extract_text(io.BytesIO(data))
-    except Exception:
-        logger.exception("PDF parse fail")
-        raise HTTPException(status_code=422, detail="PDF read nahi ho paayi (corrupt ya protected).")
+        reader = PdfReader(io.BytesIO(raw))
+        pages = [(p.extract_text() or "") for p in reader.pages]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
 
-    total_chars = sum(len(p["text"].strip()) for p in pages)
-    if total_chars == 0:
+    chunks = chunk_pages(pages)
+    if not chunks:
         raise HTTPException(
-            status_code=422,
-            detail="PDF se text nahi nikla. Shayad scanned PDF hai (OCR chahiye).",
+            status_code=400,
+            detail="No text found. The PDF may be scanned images (needs OCR).",
         )
-
     doc_id = uuid.uuid4().hex
-    try:
-        num_chunks = add_document(doc_id, pages)
-        save_document(doc_id, file.filename, len(pages), num_chunks)
-    except Exception:
-        logger.exception("Document store fail")
-        # adhoora data chhodna nahi hai
-        try:
-            delete_document(doc_id)
-        except Exception:
-            logger.exception("Cleanup fail")
-        raise HTTPException(status_code=500, detail="Document save karte time error aaya.")
+    documents[doc_id] = {
+        "filename": os.path.basename(file.filename),
+        "pages": len(pages),
+        "chunks": chunks,
+        "file_hash": file_hash,
+    }
+    history[doc_id] = []
+    save_data()
 
-    logger.info("Uploaded %s | doc_id=%s pages=%d chunks=%d", file.filename, doc_id, len(pages), num_chunks)
     return {
         "doc_id": doc_id,
-        "filename": file.filename,
+        "filename": documents[doc_id]["filename"],
         "pages": len(pages),
-        "chunks": num_chunks,
-        "chars_extracted": total_chars,
+        "chunks": len(chunks),
+        "chars_extracted": sum(len(p) for p in pages),
     }
 
 
-@app.post("/ask/", response_model=AskResponse)
-def ask(req: AskRequest):
-    if get_document(req.doc_id) is None:
-        raise HTTPException(status_code=404, detail="doc_id nahi mila. Pehle PDF upload karo.")
+@app.post("/ask/", dependencies=[Depends(verify_key)])
+async def ask(req: QuestionRequest):
+    doc = documents.get(req.doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="doc_id not found. Upload the PDF first.")
 
-    question = req.question.strip()
+    matched = keyword_search(req.question, doc["chunks"])
+    context = "\n\n".join(f"[Page {c['page']}] {c['text']}" for c in matched)
 
     try:
-        chunks = search(req.doc_id, question, TOP_K)
-    except Exception:
-        logger.exception("Search fail")
-        raise HTTPException(status_code=500, detail="Search me error aaya.")
+        answer = ask_llm(req.question, context)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM error: {e}")
 
-    # Context nahi mila to LLM call mat karo (paisa bachta hai, hallucination bhi nahi hota)
-    if not chunks:
-        save_chat(req.doc_id, question, NOT_FOUND_MSG)
-        return AskResponse(doc_id=req.doc_id, question=question, answer=NOT_FOUND_MSG, sources=[])
+    history.setdefault(req.doc_id, []).append({"question": req.question, "answer": answer})
+    save_data()
 
-    if USE_MOCK:
-        answer = f"[MOCK] {len(chunks)} relevant chunks mile. Real API ke liye USE_MOCK=false karo."
-    else:
-        try:
-            answer = generate_answer(question, chunks)
-        except Exception:
-            logger.exception("LLM call fail")
-            raise HTTPException(status_code=502, detail="LLM se answer nahi aaya. API key/credits check karo.")
-
-    save_chat(req.doc_id, question, answer)
-    sources = [{"page": c.get("page"), "distance": c.get("distance"), "preview": c["text"][:200]} for c in chunks]
-    return AskResponse(doc_id=req.doc_id, question=question, answer=answer, sources=sources)
+    return {
+        "doc_id": req.doc_id,
+        "question": req.question,
+        "answer": answer,
+        "sources": [{"page": c["page"], "preview": c["text"][:150]} for c in matched],
+    }

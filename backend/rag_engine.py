@@ -1,8 +1,6 @@
 import os
 from pathlib import Path
-
 import chromadb
-
 from backend.pdf_processor import chunk_text
 
 CHROMA_PATH = Path(__file__).resolve().parent.parent / "chroma_data"
@@ -77,3 +75,4 @@ def search(doc_id, question, top_k=4):
 def delete_document(doc_id):
     get_collection().delete(where={"doc_id": doc_id})
 
+    
