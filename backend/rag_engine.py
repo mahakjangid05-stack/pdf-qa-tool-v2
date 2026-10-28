@@ -9,14 +9,12 @@ BATCH_SIZE = 100
 
 # Cosine distance: chhota = zyada similar.
 # Sahi sawaalon pe bhi "nahi mila" aaye to badhao (1.1, 1.2),
-# bekaar sawaalon pe bhi answer aaye to ghatao (0.9, 0.8).
+# bekaar sawaalon pe bhi answer aaye to ghatao (0F.9, 0.8).
 MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "1.0"))
 
 _collection = None
-
-
-def get_collection():
-    global _collection
+get_collection():
+global _collection
     if _collection is None:
         client = chromadb.PersistentClient(path=str(CHROMA_PATH))
         _collection = client.get_or_create_collection(
@@ -60,19 +58,3 @@ def search(doc_id, question, top_k=4):
         n_results=top_k,
         where={"doc_id": doc_id},
     )
-
-    docs = res["documents"][0]
-    metas = res["metadatas"][0]
-    dists = res["distances"][0]
-
-    results = []
-    for text, meta, dist in zip(docs, metas, dists):
-        if dist <= MAX_DISTANCE:
-            results.append({"text": text, "page": meta.get("page"), "distance": round(dist, 4)})
-    return results
-
-
-def delete_document(doc_id):
-    get_collection().delete(where={"doc_id": doc_id})
-
-    

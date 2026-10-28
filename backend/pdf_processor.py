@@ -1,7 +1,5 @@
 import re
-
 from PyPDF2 import PdfReader
-
 
 def extract_text(pdf_source):
     """pdf_source: file path ya file-like object (io.BytesIO).
