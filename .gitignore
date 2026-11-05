@@ -3,4 +3,4 @@ data.json
 chroma_data/
 documents.db
 __pycache__/
-venv/
+venv/*.lnk
